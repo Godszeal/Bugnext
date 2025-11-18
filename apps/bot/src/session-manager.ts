@@ -1,9 +1,11 @@
+
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  WASocket
+  WASocket,
+  Browsers
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -117,7 +119,6 @@ export class SessionManager {
     const sessionId = `session-${cleanNumber}`;
     const sessionAuthPath = path.join(this.authDir, sessionId);
 
-    // If session exists and is already connected, return it
     const existingSession = this.sessions.get(sessionId);
     if (existingSession && existingSession.status === 'connected') {
       console.log(`Session ${sessionId} is already connected`);
@@ -128,19 +129,12 @@ export class SessionManager {
       };
     }
 
-    // Delete old session files if they exist but are logged out
     if (fs.existsSync(sessionAuthPath)) {
-      const credsPath = path.join(sessionAuthPath, 'creds.json');
-      if (fs.existsSync(credsPath)) {
-        console.log(`Removing old session files for ${cleanNumber}`);
-        fs.rmSync(sessionAuthPath, { recursive: true, force: true });
-      }
+      console.log(`Removing old session files for ${cleanNumber}`);
+      fs.rmSync(sessionAuthPath, { recursive: true, force: true });
     }
 
-    if (!fs.existsSync(sessionAuthPath)) {
-      fs.mkdirSync(sessionAuthPath, { recursive: true });
-    }
-
+    fs.mkdirSync(sessionAuthPath, { recursive: true });
     this.saveSessionMetadata(sessionId, cleanNumber);
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionAuthPath);
@@ -154,10 +148,11 @@ export class SessionManager {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
       },
-      browser: ['Multi-Session Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: true,
+      browser: Browsers.ubuntu('Chrome'),
+      generateHighQualityLinkPreview: true,
       syncFullHistory: false,
-      shouldIgnoreJid: () => false
+      markOnlineOnConnect: false,
+      getMessage: async () => undefined
     });
 
     this.sessions.set(sessionId, {
@@ -181,22 +176,17 @@ export class SessionManager {
     let pairingCode: string | undefined;
 
     try {
-      // Wait a bit for socket to be ready
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 3000));
       
-      // Check if socket is open
       if (!sock.authState.creds.registered) {
-        console.log(`Socket ready. Requesting pairing code for number: ${cleanNumber}`);
-        console.log(`Number format: ${cleanNumber} (length: ${cleanNumber.length})`);
+        console.log(`🔐 Requesting pairing code for: +${cleanNumber}`);
         
-        // Request pairing code - Baileys expects just the number without '+'
         const code = await sock.requestPairingCode(cleanNumber);
         
         if (!code) {
-          throw new Error('Pairing code generation returned empty');
+          throw new Error('Failed to generate pairing code');
         }
         
-        // Format code as XXXX-XXXX for better readability
         pairingCode = code.match(/.{1,4}/g)?.join('-') || code;
         
         const session = this.sessions.get(sessionId);
@@ -205,20 +195,16 @@ export class SessionManager {
           session.status = 'pending';
         }
         
-        console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
-        console.log(`📱 Enter this code in WhatsApp: Settings → Linked Devices → Link a Device → "Link with phone number instead"`);
-        console.log(`⏳ Waiting for user to enter pairing code in WhatsApp...`);
-        console.log(`🔄 Keep this session alive, do not close!`);
+        console.log(`✅ Pairing code generated: ${pairingCode}`);
+        console.log(`📱 Enter this code in WhatsApp to link device`);
+        console.log(`⏳ Waiting for authentication (keep session alive)...`);
       } else {
         console.log(`Device already registered for ${cleanNumber}`);
         pairingCode = 'ALREADY-REGISTERED';
       }
     } catch (error) {
-      console.error('Error requesting pairing code:', error);
-      console.error('Phone number used:', cleanNumber);
-      console.error('Error details:', error instanceof Error ? error.stack : error);
+      console.error('❌ Pairing code generation failed:', error);
       
-      // Clean up failed session
       this.sessions.delete(sessionId);
       if (fs.existsSync(sessionAuthPath)) {
         fs.rmSync(sessionAuthPath, { recursive: true, force: true });
@@ -256,8 +242,10 @@ export class SessionManager {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
         },
-        browser: ['Multi-Session Bot', 'Chrome', '120.0.0'],
-        markOnlineOnConnect: true
+        browser: Browsers.ubuntu('Chrome'),
+        generateHighQualityLinkPreview: true,
+        markOnlineOnConnect: false,
+        getMessage: async () => undefined
       });
 
       const existingSession = this.sessions.get(sessionId);
@@ -292,56 +280,57 @@ export class SessionManager {
   }
 
   private async handleConnectionUpdate(sessionId: string, update: any) {
-    const { connection, lastDisconnect, qr, isNewLogin } = update;
+    const { connection, lastDisconnect } = update;
     const session = this.sessions.get(sessionId);
 
     if (!session) return;
 
-    console.log(`[${sessionId}] Connection update:`, { 
-      connection, 
-      isNewLogin, 
-      status: session.status,
-      hasError: !!lastDisconnect?.error 
-    });
+    console.log(`[${sessionId}] Status: ${connection || 'updating'}`);
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
 
-      console.log(`Session ${sessionId} disconnected. Status: ${statusCode}, Error: ${errorMessage}, Reconnect: ${shouldReconnect}`);
-
-      // If pending pairing, we need to handle 401 differently - it might be normal during pairing
       if (session.status === 'pending' && session.pairingCode) {
-        if (statusCode === 401 || statusCode === DisconnectReason.restartRequired) {
-          console.log(`Session ${sessionId} connection closed during pairing (normal), will reconnect automatically when user enters code`);
-          // Keep session in pending state, don't mark as disconnected
-          return;
-        }
+        console.log(`[${sessionId}] Socket closed during pairing - waiting for user to enter code`);
+        return;
       }
 
-      if (shouldReconnect && statusCode !== DisconnectReason.connectionClosed && statusCode !== 401) {
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.log(`[${sessionId}] ❌ Logged out, cleaning up session`);
+        session.status = 'disconnected';
+        session.socket = null;
+        
+        const sessionAuthPath = path.join(this.authDir, sessionId);
+        if (fs.existsSync(sessionAuthPath)) {
+          fs.rmSync(sessionAuthPath, { recursive: true, force: true });
+        }
+      } else if (shouldReconnect) {
+        console.log(`[${sessionId}] Reconnecting in 5 seconds...`);
         session.status = 'connecting';
-        console.log(`Attempting to reconnect session ${sessionId} in 5 seconds...`);
+        
         setTimeout(async () => {
           try {
             await this.reconnectSession(sessionId, session.phoneNumber);
           } catch (error) {
-            console.error(`Failed to reconnect session ${sessionId}:`, error);
+            console.error(`Failed to reconnect ${sessionId}:`, error);
             session.status = 'disconnected';
           }
         }, 5000);
       } else {
-        console.log(`Session ${sessionId} logged out or permanently closed (code: ${statusCode}), marking as disconnected`);
         session.status = 'disconnected';
         session.socket = null;
       }
     } else if (connection === 'open') {
-      console.log(`✅ Session ${sessionId} connected successfully! Phone: +${session.phoneNumber}`);
+      console.log(`✅ [${sessionId}] Connected successfully! Phone: +${session.phoneNumber}`);
       session.status = 'connected';
       session.lastActive = new Date();
+      
+      if (session.pairingCode) {
+        console.log(`🎉 Pairing successful for +${session.phoneNumber}!`);
+        delete session.pairingCode;
+      }
     } else if (connection === 'connecting') {
-      console.log(`[${sessionId}] Connecting to WhatsApp...`);
       if (session.status !== 'pending') {
         session.status = 'connecting';
       }
