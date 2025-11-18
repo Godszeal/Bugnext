@@ -117,11 +117,23 @@ export class SessionManager {
     const sessionId = `session-${cleanNumber}`;
     const sessionAuthPath = path.join(this.authDir, sessionId);
 
+    // If session exists and is already connected, return it
+    const existingSession = this.sessions.get(sessionId);
+    if (existingSession && existingSession.status === 'connected') {
+      console.log(`Session ${sessionId} is already connected`);
+      return {
+        sessionId,
+        phoneNumber: cleanNumber,
+        status: 'connected'
+      };
+    }
+
+    // Delete old session files if they exist but are logged out
     if (fs.existsSync(sessionAuthPath)) {
       const credsPath = path.join(sessionAuthPath, 'creds.json');
       if (fs.existsSync(credsPath)) {
-        console.log(`Session already exists for ${cleanNumber}, reconnecting...`);
-        return await this.reconnectSession(sessionId, cleanNumber);
+        console.log(`Removing old session files for ${cleanNumber}`);
+        fs.rmSync(sessionAuthPath, { recursive: true, force: true });
       }
     }
 
@@ -143,12 +155,14 @@ export class SessionManager {
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
       },
       browser: ['Multi-Session Bot', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: true
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      shouldIgnoreJid: () => false
     });
 
     this.sessions.set(sessionId, {
       socket: sock,
-      status: 'connecting',
+      status: 'pending',
       phoneNumber: cleanNumber,
       createdAt: new Date(),
       lastActive: new Date()
@@ -166,19 +180,27 @@ export class SessionManager {
 
     let pairingCode: string | undefined;
 
-    if (!sock.authState.creds.registered) {
-      try {
-        const code = await sock.requestPairingCode(cleanNumber);
-        pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
-        
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          session.pairingCode = pairingCode;
-        }
-      } catch (error) {
-        console.error('Error requesting pairing code:', error);
-        throw new Error('Failed to generate pairing code');
+    try {
+      // Wait a bit for socket to initialize
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      const code = await sock.requestPairingCode(cleanNumber);
+      pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
+      
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.pairingCode = pairingCode;
       }
+      
+      console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
+    } catch (error) {
+      console.error('Error requesting pairing code:', error);
+      // Clean up failed session
+      this.sessions.delete(sessionId);
+      if (fs.existsSync(sessionAuthPath)) {
+        fs.rmSync(sessionAuthPath, { recursive: true, force: true });
+      }
+      throw new Error('Failed to generate pairing code');
     }
 
     return {
@@ -246,17 +268,24 @@ export class SessionManager {
   }
 
   private async handleConnectionUpdate(sessionId: string, update: any) {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
     const session = this.sessions.get(sessionId);
 
     if (!session) return;
 
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      console.log(`Session ${sessionId} disconnected. Reconnect: ${shouldReconnect}`);
+      console.log(`Session ${sessionId} disconnected. Status: ${statusCode}, Reconnect: ${shouldReconnect}`);
 
-      if (shouldReconnect) {
+      // Don't reconnect if it's a fresh session waiting for pairing
+      if (session.status === 'pending') {
+        console.log(`Session ${sessionId} is pending pairing, keeping alive`);
+        return;
+      }
+
+      if (shouldReconnect && statusCode !== DisconnectReason.connectionClosed) {
         session.status = 'connecting';
         setTimeout(async () => {
           try {
@@ -267,7 +296,7 @@ export class SessionManager {
           }
         }, 5000);
       } else {
-        console.log(`Session ${sessionId} logged out, marking as disconnected`);
+        console.log(`Session ${sessionId} logged out or closed, marking as disconnected`);
         session.status = 'disconnected';
         session.socket = null;
       }
@@ -276,7 +305,9 @@ export class SessionManager {
       session.status = 'connected';
       session.lastActive = new Date();
     } else if (connection === 'connecting') {
-      session.status = 'connecting';
+      if (session.status !== 'pending') {
+        session.status = 'connecting';
+      }
     }
   }
 
@@ -287,22 +318,43 @@ export class SessionManager {
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
     
     console.log(`[${sessionId}] Message from ${msg.key.remoteJid}: ${text}`);
 
-    if (text === '!ping') {
-      await session.socket.sendMessage(msg.key.remoteJid!, { 
-        text: '🏓 Pong! Your session is active and working!' 
-      });
-    } else if (text === '!help') {
-      await session.socket.sendMessage(msg.key.remoteJid!, { 
-        text: `📱 *WhatsApp Multi-Session Bot*\n\nAvailable Commands:\n!ping - Test connection\n!help - Show this message\n!info - Session information\n\nYour session ID: ${sessionId}` 
-      });
-    } else if (text === '!info') {
-      await session.socket.sendMessage(msg.key.remoteJid!, { 
-        text: `📊 *Session Info*\n\nID: ${sessionId}\nPhone: +${session.phoneNumber}\nStatus: ${session.status}\nCreated: ${session.createdAt.toLocaleString()}\nLast Active: ${session.lastActive.toLocaleString()}` 
-      });
+    try {
+      if (text === '!ping') {
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: '🏓 Pong! Your session is active and working!' 
+        });
+      } else if (text === '!help') {
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `📱 *WhatsApp Multi-Session Bot*\n\nAvailable Commands:\n• !ping - Test connection\n• !help - Show this message\n• !info - Session information\n• !status - Check bot status\n• !commands - List all commands\n\nYour session ID: ${sessionId}` 
+        });
+      } else if (text === '!info') {
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `📊 *Session Info*\n\nID: ${sessionId}\nPhone: +${session.phoneNumber}\nStatus: ${session.status}\nCreated: ${session.createdAt.toLocaleString()}\nLast Active: ${session.lastActive.toLocaleString()}` 
+        });
+      } else if (text === '!status') {
+        const uptime = Date.now() - session.createdAt.getTime();
+        const hours = Math.floor(uptime / (1000 * 60 * 60));
+        const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+        
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `✅ *Bot Status*\n\nStatus: ${session.status}\nUptime: ${hours}h ${minutes}m\nSession: Active\nConnection: Stable` 
+        });
+      } else if (text === '!commands') {
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `🤖 *Available Commands*\n\n*General:*\n• !ping - Test bot\n• !help - Show help\n• !info - Session info\n• !status - Bot status\n• !commands - This list\n\n*Coming Soon:*\n• Auto-reply\n• Scheduled messages\n• Group management\n• Media handling` 
+        });
+      } else if (text.startsWith('!echo ')) {
+        const echoText = text.substring(6);
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: echoText 
+        });
+      }
+    } catch (error) {
+      console.error(`Error handling message for ${sessionId}:`, error);
     }
 
     session.lastActive = new Date();
