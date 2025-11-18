@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import './commands/loader'; // Load all commands
 import { SessionManager } from './session-manager';
 
 const app = express();

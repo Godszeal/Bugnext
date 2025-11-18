@@ -5,13 +5,23 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   WASocket,
-  Browsers
+  Browsers,
+  WAMessage
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+// Import command system
+import './commands/general';
+import './commands/ai';
+import './commands/media';
+import './commands/fun';
+import './commands/settings';
+import { findCommand } from './commands';
+import { getSettings } from './utils/settings';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -355,12 +365,24 @@ export class SessionManager {
         delete session.pairingCode;
       }
       
-      // Send welcome message automatically on first connection
+      // Send welcome message and auto-follow newsletter
       setTimeout(async () => {
         try {
           const userJid = `${session.phoneNumber}@s.whatsapp.net`;
+          const settings = await getSettings(userJid);
+          
+          // Auto-follow newsletter if enabled
+          if (settings.autoFollow && settings.newsletterJid) {
+            try {
+              await session.socket?.newsletterFollow(settings.newsletterJid);
+              console.log(`📢 Auto-followed newsletter for ${session.phoneNumber}`);
+            } catch (error) {
+              console.error(`Failed to follow newsletter:`, error);
+            }
+          }
+          
           await session.socket?.sendMessage(userJid, {
-            text: `🎉 *Connection Successful!*\n\n✅ Your WhatsApp bot is now connected and active!\n\n📱 Phone: +${session.phoneNumber}\n🆔 Session: ${sessionId}\n\n💡 Type */menu* to see all available commands.\n\n🤖 Your bot is ready to use!`
+            text: `🎉 *Connection Successful!*\n\n✅ Your WhatsApp bot is now connected and active!\n\n📱 Phone: +${session.phoneNumber}\n🆔 Session: ${sessionId}\n\n💡 Type *${settings.prefix}menu* to see all available commands.\n📢 Newsletter: Auto-followed GodsZeal Updates\n\n🤖 Your bot is ready to use!`
           });
           console.log(`📨 Sent welcome message to +${session.phoneNumber}`);
         } catch (error) {
@@ -375,67 +397,43 @@ export class SessionManager {
     }
   }
 
-  private async handleMessages(sessionId: string, messages: any[]) {
+  private async handleMessages(sessionId: string, messages: WAMessage[]) {
     const session = this.sessions.get(sessionId);
     if (!session || !session.socket) return;
 
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    const text = msg.message.conversation || 
+                 msg.message.extendedTextMessage?.text || 
+                 msg.message.imageMessage?.caption ||
+                 msg.message.videoMessage?.caption || '';
     
     console.log(`[${sessionId}] Message from ${msg.key.remoteJid}: ${text}`);
 
     try {
-      // Support both ! and / prefixes
-      const command = text.toLowerCase();
+      // Get user settings for prefix
+      const settings = await getSettings(msg.key.remoteJid!);
       
-      if (command === '!ping' || command === '/ping') {
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: '🏓 Pong! Your session is active and working!' 
-        });
-      } else if (command === '/menu' || command === '!menu' || command === '!help' || command === '/help') {
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `🤖 *WhatsApp Bot - Command Menu*\n\n*📋 General Commands:*\n• /menu - Show this menu\n• /ping - Test bot connection\n• /info - Session information\n• /status - Bot status & uptime\n• /help - Show help guide\n\n*💬 Message Commands:*\n• /echo [text] - Echo a message\n\n*🔧 Utility Commands:*\n• /alive - Check if bot is alive\n• /uptime - Show session uptime\n\n*ℹ️ Session Info:*\n• ID: ${sessionId}\n• Phone: +${session.phoneNumber}\n• Status: ${session.status}\n\n📱 Type any command to get started!` 
-        });
-      } else if (command === '!info' || command === '/info') {
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `📊 *Session Information*\n\n🆔 Session ID: ${sessionId}\n📱 Phone: +${session.phoneNumber}\n✅ Status: ${session.status}\n📅 Created: ${session.createdAt.toLocaleString()}\n⏱️ Last Active: ${session.lastActive.toLocaleString()}\n\n💡 Type /menu for all commands` 
-        });
-      } else if (command === '!status' || command === '/status') {
-        const uptime = Date.now() - session.createdAt.getTime();
-        const hours = Math.floor(uptime / (1000 * 60 * 60));
-        const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
-        const seconds = Math.floor((uptime % (1000 * 60)) / 1000);
-        
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `✅ *Bot Status*\n\n🟢 Status: ${session.status}\n⏰ Uptime: ${hours}h ${minutes}m ${seconds}s\n📱 Session: Active\n🔗 Connection: Stable\n📊 Messages Handled: Active\n\n💡 Type /menu for commands` 
-        });
-      } else if (command === '!alive' || command === '/alive') {
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: '✅ Yes! Bot is alive and running perfectly! 🤖' 
-        });
-      } else if (command === '!uptime' || command === '/uptime') {
-        const uptime = Date.now() - session.createdAt.getTime();
-        const hours = Math.floor(uptime / (1000 * 60 * 60));
-        const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
-        const seconds = Math.floor((uptime % (1000 * 60)) / 1000);
-        
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `⏰ *Session Uptime*\n\n🕐 ${hours} hours, ${minutes} minutes, ${seconds} seconds\n\n📅 Started: ${session.createdAt.toLocaleString()}` 
-        });
-      } else if (text.startsWith('!echo ') || text.startsWith('/echo ')) {
-        const echoText = text.substring(6);
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: echoText 
-        });
-      } else if (command === '!commands' || command === '/commands') {
-        await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `🤖 *All Available Commands*\n\n*Basic:*\n• /menu, /help - Command menu\n• /ping - Test connection\n• /alive - Check bot status\n• /info - Session details\n• /status - Full bot status\n• /uptime - Session uptime\n\n*Messages:*\n• /echo [text] - Repeat message\n\n💡 You can use ! or / prefix for commands` 
-        });
+      // Find and execute command
+      const commandData = findCommand(text, settings.prefix);
+      
+      if (commandData) {
+        console.log(`[${sessionId}] Executing command: ${commandData.command.name}`);
+        await commandData.command.execute(session.socket, msg, commandData.args, settings.prefix);
       }
     } catch (error) {
       console.error(`Error handling message for ${sessionId}:`, error);
+      
+      try {
+        await session.socket.sendMessage(msg.key.remoteJid!, {
+          text: '❌ An error occurred while processing your command.'
+        }, {
+          quoted: msg
+        });
+      } catch (sendError) {
+        console.error(`Failed to send error message:`, sendError);
+      }
     }
 
     session.lastActive = new Date();
