@@ -181,42 +181,61 @@ export class SessionManager {
     let pairingCode: string | undefined;
 
     try {
-      // Wait a bit for socket to initialize
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait for connection.update event to ensure socket is ready
+      const connectionPromise = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Socket initialization timeout'));
+        }, 15000);
+
+        const handler = (update: any) => {
+          if (update.isNewLogin === false || update.connection === 'connecting') {
+            clearTimeout(timeout);
+            sock.ev.off('connection.update', handler);
+            resolve();
+          }
+        };
+
+        sock.ev.on('connection.update', handler);
+      });
+
+      console.log(`Waiting for socket to initialize for ${cleanNumber}...`);
+      await connectionPromise;
       
-      // Check if socket is ready
-      if (!sock.user) {
-        console.log(`Socket initializing for ${cleanNumber}, waiting...`);
-        await new Promise(resolve => setTimeout(resolve, 3000));
-      }
+      // Additional safety wait
+      await new Promise(resolve => setTimeout(resolve, 1000));
       
-      // WhatsApp expects the number in international format without '+'
-      // Example: For Nigeria +234, number should be like 2349074488015
-      console.log(`Requesting pairing code for number: ${cleanNumber}`);
-      console.log(`Number length: ${cleanNumber.length}, First digits: ${cleanNumber.substring(0, 5)}`);
+      console.log(`Socket ready. Requesting pairing code for number: ${cleanNumber}`);
+      console.log(`Number format: ${cleanNumber} (length: ${cleanNumber.length})`);
       
+      // Request pairing code - Baileys expects just the number without '+'
       const code = await sock.requestPairingCode(cleanNumber);
       
       if (!code) {
         throw new Error('Pairing code generation returned empty');
       }
       
+      // Format code as XXXX-XXXX for better readability
       pairingCode = code.match(/.{1,4}/g)?.join('-') || code;
       
       const session = this.sessions.get(sessionId);
       if (session) {
         session.pairingCode = pairingCode;
+        session.status = 'pending';
       }
       
       console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
+      console.log(`📱 Enter this code in WhatsApp: Settings → Linked Devices → Link a Device → "Link with phone number instead"`);
     } catch (error) {
       console.error('Error requesting pairing code:', error);
       console.error('Phone number used:', cleanNumber);
+      console.error('Error details:', error instanceof Error ? error.stack : error);
+      
       // Clean up failed session
       this.sessions.delete(sessionId);
       if (fs.existsSync(sessionAuthPath)) {
         fs.rmSync(sessionAuthPath, { recursive: true, force: true });
       }
+      
       throw new Error(`Failed to generate pairing code: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 
@@ -285,25 +304,34 @@ export class SessionManager {
   }
 
   private async handleConnectionUpdate(sessionId: string, update: any) {
-    const { connection, lastDisconnect, qr } = update;
+    const { connection, lastDisconnect, qr, isNewLogin } = update;
     const session = this.sessions.get(sessionId);
 
     if (!session) return;
 
+    console.log(`[${sessionId}] Connection update:`, { 
+      connection, 
+      isNewLogin, 
+      status: session.status,
+      hasError: !!lastDisconnect?.error 
+    });
+
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
 
-      console.log(`Session ${sessionId} disconnected. Status: ${statusCode}, Reconnect: ${shouldReconnect}`);
+      console.log(`Session ${sessionId} disconnected. Status: ${statusCode}, Error: ${errorMessage}, Reconnect: ${shouldReconnect}`);
 
       // Don't reconnect if it's a fresh session waiting for pairing
       if (session.status === 'pending') {
-        console.log(`Session ${sessionId} is pending pairing, keeping alive`);
+        console.log(`Session ${sessionId} is pending pairing code entry, keeping connection alive`);
         return;
       }
 
-      if (shouldReconnect && statusCode !== DisconnectReason.connectionClosed) {
+      if (shouldReconnect && statusCode !== DisconnectReason.connectionClosed && statusCode !== 401) {
         session.status = 'connecting';
+        console.log(`Attempting to reconnect session ${sessionId} in 5 seconds...`);
         setTimeout(async () => {
           try {
             await this.reconnectSession(sessionId, session.phoneNumber);
@@ -313,15 +341,16 @@ export class SessionManager {
           }
         }, 5000);
       } else {
-        console.log(`Session ${sessionId} logged out or closed, marking as disconnected`);
+        console.log(`Session ${sessionId} logged out or permanently closed (code: ${statusCode}), marking as disconnected`);
         session.status = 'disconnected';
         session.socket = null;
       }
     } else if (connection === 'open') {
-      console.log(`✅ Session ${sessionId} connected successfully!`);
+      console.log(`✅ Session ${sessionId} connected successfully! Phone: +${session.phoneNumber}`);
       session.status = 'connected';
       session.lastActive = new Date();
     } else if (connection === 'connecting') {
+      console.log(`[${sessionId}] Connecting to WhatsApp...`);
       if (session.status !== 'pending') {
         session.status = 'connecting';
       }
