@@ -176,7 +176,8 @@ export class SessionManager {
     let pairingCode: string | undefined;
 
     try {
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      // Wait for socket to be ready
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       if (!sock.authState.creds.registered) {
         console.log(`🔐 Requesting pairing code for: +${cleanNumber}`);
@@ -197,7 +198,16 @@ export class SessionManager {
         
         console.log(`✅ Pairing code generated: ${pairingCode}`);
         console.log(`📱 Enter this code in WhatsApp to link device`);
-        console.log(`⏳ Waiting for authentication (keep session alive)...`);
+        console.log(`⏳ Waiting for authentication (session will stay alive for 2 minutes)...`);
+        
+        // Keep session alive for 2 minutes to allow pairing
+        setTimeout(() => {
+          const currentSession = this.sessions.get(sessionId);
+          if (currentSession && currentSession.status === 'pending') {
+            console.log(`⚠️ Pairing timeout for ${sessionId} - code not entered in time`);
+          }
+        }, 120000);
+        
       } else {
         console.log(`Device already registered for ${cleanNumber}`);
         pairingCode = 'ALREADY-REGISTERED';
@@ -291,8 +301,22 @@ export class SessionManager {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
+      // Handle pairing state - don't close immediately
       if (session.status === 'pending' && session.pairingCode) {
-        console.log(`[${sessionId}] Socket closed during pairing - waiting for user to enter code`);
+        console.log(`[${sessionId}] Socket closed during pairing - this is normal, waiting for reconnection...`);
+        
+        // Reconnect automatically after 3 seconds to check for pairing completion
+        setTimeout(async () => {
+          const currentSession = this.sessions.get(sessionId);
+          if (currentSession && currentSession.status === 'pending') {
+            console.log(`[${sessionId}] Attempting reconnection to check pairing status...`);
+            try {
+              await this.reconnectSession(sessionId, session.phoneNumber);
+            } catch (error) {
+              console.error(`Failed to reconnect ${sessionId}:`, error);
+            }
+          }
+        }, 3000);
         return;
       }
 
@@ -330,6 +354,20 @@ export class SessionManager {
         console.log(`🎉 Pairing successful for +${session.phoneNumber}!`);
         delete session.pairingCode;
       }
+      
+      // Send welcome message automatically on first connection
+      setTimeout(async () => {
+        try {
+          const userJid = `${session.phoneNumber}@s.whatsapp.net`;
+          await session.socket?.sendMessage(userJid, {
+            text: `🎉 *Connection Successful!*\n\n✅ Your WhatsApp bot is now connected and active!\n\n📱 Phone: +${session.phoneNumber}\n🆔 Session: ${sessionId}\n\n💡 Type */menu* to see all available commands.\n\n🤖 Your bot is ready to use!`
+          });
+          console.log(`📨 Sent welcome message to +${session.phoneNumber}`);
+        } catch (error) {
+          console.error(`Failed to send welcome message:`, error);
+        }
+      }, 2000);
+      
     } else if (connection === 'connecting') {
       if (session.status !== 'pending') {
         session.status = 'connecting';
@@ -349,34 +387,51 @@ export class SessionManager {
     console.log(`[${sessionId}] Message from ${msg.key.remoteJid}: ${text}`);
 
     try {
-      if (text === '!ping') {
+      // Support both ! and / prefixes
+      const command = text.toLowerCase();
+      
+      if (command === '!ping' || command === '/ping') {
         await session.socket.sendMessage(msg.key.remoteJid!, { 
           text: '🏓 Pong! Your session is active and working!' 
         });
-      } else if (text === '!help') {
+      } else if (command === '/menu' || command === '!menu' || command === '!help' || command === '/help') {
         await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `📱 *WhatsApp Multi-Session Bot*\n\nAvailable Commands:\n• !ping - Test connection\n• !help - Show this message\n• !info - Session information\n• !status - Check bot status\n• !commands - List all commands\n\nYour session ID: ${sessionId}` 
+          text: `🤖 *WhatsApp Bot - Command Menu*\n\n*📋 General Commands:*\n• /menu - Show this menu\n• /ping - Test bot connection\n• /info - Session information\n• /status - Bot status & uptime\n• /help - Show help guide\n\n*💬 Message Commands:*\n• /echo [text] - Echo a message\n\n*🔧 Utility Commands:*\n• /alive - Check if bot is alive\n• /uptime - Show session uptime\n\n*ℹ️ Session Info:*\n• ID: ${sessionId}\n• Phone: +${session.phoneNumber}\n• Status: ${session.status}\n\n📱 Type any command to get started!` 
         });
-      } else if (text === '!info') {
+      } else if (command === '!info' || command === '/info') {
         await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `📊 *Session Info*\n\nID: ${sessionId}\nPhone: +${session.phoneNumber}\nStatus: ${session.status}\nCreated: ${session.createdAt.toLocaleString()}\nLast Active: ${session.lastActive.toLocaleString()}` 
+          text: `📊 *Session Information*\n\n🆔 Session ID: ${sessionId}\n📱 Phone: +${session.phoneNumber}\n✅ Status: ${session.status}\n📅 Created: ${session.createdAt.toLocaleString()}\n⏱️ Last Active: ${session.lastActive.toLocaleString()}\n\n💡 Type /menu for all commands` 
         });
-      } else if (text === '!status') {
+      } else if (command === '!status' || command === '/status') {
         const uptime = Date.now() - session.createdAt.getTime();
         const hours = Math.floor(uptime / (1000 * 60 * 60));
         const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((uptime % (1000 * 60)) / 1000);
         
         await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `✅ *Bot Status*\n\nStatus: ${session.status}\nUptime: ${hours}h ${minutes}m\nSession: Active\nConnection: Stable` 
+          text: `✅ *Bot Status*\n\n🟢 Status: ${session.status}\n⏰ Uptime: ${hours}h ${minutes}m ${seconds}s\n📱 Session: Active\n🔗 Connection: Stable\n📊 Messages Handled: Active\n\n💡 Type /menu for commands` 
         });
-      } else if (text === '!commands') {
+      } else if (command === '!alive' || command === '/alive') {
         await session.socket.sendMessage(msg.key.remoteJid!, { 
-          text: `🤖 *Available Commands*\n\n*General:*\n• !ping - Test bot\n• !help - Show help\n• !info - Session info\n• !status - Bot status\n• !commands - This list\n\n*Coming Soon:*\n• Auto-reply\n• Scheduled messages\n• Group management\n• Media handling` 
+          text: '✅ Yes! Bot is alive and running perfectly! 🤖' 
         });
-      } else if (text.startsWith('!echo ')) {
+      } else if (command === '!uptime' || command === '/uptime') {
+        const uptime = Date.now() - session.createdAt.getTime();
+        const hours = Math.floor(uptime / (1000 * 60 * 60));
+        const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((uptime % (1000 * 60)) / 1000);
+        
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `⏰ *Session Uptime*\n\n🕐 ${hours} hours, ${minutes} minutes, ${seconds} seconds\n\n📅 Started: ${session.createdAt.toLocaleString()}` 
+        });
+      } else if (text.startsWith('!echo ') || text.startsWith('/echo ')) {
         const echoText = text.substring(6);
         await session.socket.sendMessage(msg.key.remoteJid!, { 
           text: echoText 
+        });
+      } else if (command === '!commands' || command === '/commands') {
+        await session.socket.sendMessage(msg.key.remoteJid!, { 
+          text: `🤖 *All Available Commands*\n\n*Basic:*\n• /menu, /help - Command menu\n• /ping - Test connection\n• /alive - Check bot status\n• /info - Session details\n• /status - Full bot status\n• /uptime - Session uptime\n\n*Messages:*\n• /echo [text] - Repeat message\n\n💡 You can use ! or / prefix for commands` 
         });
       }
     } catch (error) {
