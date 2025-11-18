@@ -22,15 +22,15 @@ export default function ConnectPage() {
       // Remove country code prefix if user included it
       const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
       const fullNumber = `${countryCode.replace(/[^0-9]/g, '')}${cleanPhone}`;
-      
+
       // Validate number length (should be between 10-15 digits total)
       if (fullNumber.length < 10 || fullNumber.length > 15) {
         throw new Error('Invalid phone number length. Please check and try again.');
       }
-      
+
       console.log('Requesting pairing code for:', fullNumber);
       console.log('Country code:', countryCode, 'Phone:', cleanPhone);
-      
+
       const response = await fetch('/api/sessions/create', {
         method: 'POST',
         headers: {
