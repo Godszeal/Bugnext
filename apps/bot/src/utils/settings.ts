@@ -6,12 +6,18 @@ interface UserSettings {
   prefix: string;
   autoFollow: boolean;
   newsletterJid?: string;
+  autoRead: boolean;
+  autoTyping: boolean;
+  autoRecording: boolean;
 }
 
 const defaultSettings: UserSettings = {
   prefix: '.',
-  autoFollow: true,
-  newsletterJid: '120363304325601080@newsletter'
+  autoFollow: false,
+  newsletterJid: '120363304325601080@newsletter',
+  autoRead: true,
+  autoTyping: false,
+  autoRecording: false
 };
 
 const settingsDir = path.join(process.cwd(), 'user-settings');

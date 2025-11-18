@@ -30,15 +30,28 @@ export default function DashboardPage() {
   };
 
   const deleteSession = async (sessionId: string) => {
-    if (!confirm('Are you sure you want to delete this session?')) return;
+    const deleteCode = prompt('Enter delete code to remove this session:');
+    if (!deleteCode) return;
 
     try {
-      await fetch(`/api/sessions/${sessionId}`, {
+      const response = await fetch(`http://localhost:3001/api/sessions/${sessionId}`, {
         method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ deleteCode }),
       });
-      fetchSessions();
+
+      if (response.ok) {
+        alert('Session deleted successfully!');
+        fetchSessions();
+      } else {
+        const error = await response.json();
+        alert(error.error || 'Failed to delete session');
+      }
     } catch (error) {
       console.error('Failed to delete session:', error);
+      alert('Failed to delete session');
     }
   };
 

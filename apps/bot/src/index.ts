@@ -45,11 +45,12 @@ app.get('/api/sessions/list', async (req, res) => {
 app.delete('/api/sessions/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
-    await sessionManager.deleteSession(sessionId);
+    const { deleteCode } = req.body;
+    await sessionManager.deleteSession(sessionId, deleteCode);
     res.json({ success: true });
   } catch (error) {
     console.error('Error deleting session:', error);
-    res.status(500).json({ 
+    res.status(400).json({ 
       error: error instanceof Error ? error.message : 'Failed to delete session' 
     });
   }

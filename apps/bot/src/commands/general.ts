@@ -113,3 +113,32 @@ registerCommand({
     });
   }
 });
+
+registerCommand({
+  name: 'status',
+  aliases: ['botstatus', 'info'],
+  category: '📋 General',
+  description: 'Check bot status and information',
+  async execute(sock, msg, args, prefix) {
+    const settings = await getSettings(msg.key.remoteJid!);
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    
+    let statusText = `╭━━━『 *BOT STATUS* 』━━━╮\n\n`;
+    statusText += `┃ 🤖 *Name:* GodsZeal Bot\n`;
+    statusText += `┃ ✅ *Status:* Active & Online\n`;
+    statusText += `┃ ⏰ *Uptime:* ${hours}h ${minutes}m\n`;
+    statusText += `┃ ⚙️ *Prefix:* ${settings.prefix}\n`;
+    statusText += `┃ 🔔 *Auto-read:* Enabled\n`;
+    statusText += `┃ 📱 *Your Number:* +${msg.key.remoteJid?.split('@')[0]}\n`;
+    statusText += `╰━━━━━━━━━━━━━━━━━━━╯\n\n`;
+    statusText += `💡 Type ${prefix}menu for commands`;
+    
+    await sock.sendMessage(msg.key.remoteJid!, {
+      text: statusText
+    }, {
+      quoted: msg
+    });
+  }
+});

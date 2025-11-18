@@ -183,6 +183,14 @@ export class SessionManager {
       await this.handleMessages(sessionId, messages);
     });
 
+    // Listen for message receipts
+    sock.ev.on('messages.update', () => {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.lastActive = new Date();
+      }
+    });
+
     let pairingCode: string | undefined;
 
     try {
@@ -339,13 +347,20 @@ export class SessionManager {
         if (fs.existsSync(sessionAuthPath)) {
           fs.rmSync(sessionAuthPath, { recursive: true, force: true });
         }
+        this.sessions.delete(sessionId);
       } else if (shouldReconnect) {
-        console.log(`[${sessionId}] Reconnecting in 5 seconds...`);
+        console.log(`[${sessionId}] Connection lost, reconnecting in 5 seconds...`);
         session.status = 'connecting';
         
         setTimeout(async () => {
           try {
-            await this.reconnectSession(sessionId, session.phoneNumber);
+            const sessionAuthPath = path.join(this.authDir, sessionId);
+            if (fs.existsSync(sessionAuthPath)) {
+              await this.reconnectSession(sessionId, session.phoneNumber);
+            } else {
+              console.error(`[${sessionId}] Auth directory missing, cannot reconnect`);
+              session.status = 'disconnected';
+            }
           } catch (error) {
             console.error(`Failed to reconnect ${sessionId}:`, error);
             session.status = 'disconnected';
@@ -365,26 +380,17 @@ export class SessionManager {
         delete session.pairingCode;
       }
       
-      // Send welcome message and auto-follow newsletter
+      // Send welcome message
       setTimeout(async () => {
         try {
           const userJid = `${session.phoneNumber}@s.whatsapp.net`;
           const settings = await getSettings(userJid);
           
-          // Auto-follow newsletter if enabled
-          if (settings.autoFollow && settings.newsletterJid) {
-            try {
-              await session.socket?.newsletterFollow(settings.newsletterJid);
-              console.log(`📢 Auto-followed newsletter for ${session.phoneNumber}`);
-            } catch (error) {
-              console.error(`Failed to follow newsletter:`, error);
-            }
-          }
-          
           await session.socket?.sendMessage(userJid, {
-            text: `🎉 *Connection Successful!*\n\n✅ Your WhatsApp bot is now connected and active!\n\n📱 Phone: +${session.phoneNumber}\n🆔 Session: ${sessionId}\n\n💡 Type *${settings.prefix}menu* to see all available commands.\n📢 Newsletter: Auto-followed GodsZeal Updates\n\n🤖 Your bot is ready to use!`
+            text: `🎉 *GodsZeal Bot Connected!*\n\n✅ Your WhatsApp bot is now ACTIVE and ready!\n\n📱 Phone: +${session.phoneNumber}\n🆔 Session: ${sessionId}\n⚙️ Prefix: ${settings.prefix}\n\n💡 Type *${settings.prefix}menu* to see all available commands.\n\n🤖 Bot Status: Online & Listening\n🔔 Auto-read: Enabled\n\n_Commands are now active! Start chatting with your bot._`
           });
           console.log(`📨 Sent welcome message to +${session.phoneNumber}`);
+          console.log(`✅ Bot is now actively listening for commands with prefix: ${settings.prefix}`);
         } catch (error) {
           console.error(`Failed to send welcome message:`, error);
         }
@@ -399,40 +405,73 @@ export class SessionManager {
 
   private async handleMessages(sessionId: string, messages: WAMessage[]) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.socket) return;
+    if (!session || !session.socket) {
+      console.log(`[${sessionId}] Message received but session/socket not available`);
+      return;
+    }
 
     const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    if (!msg.message) {
+      console.log(`[${sessionId}] Empty message, skipping`);
+      return;
+    }
+    
+    if (msg.key.fromMe) {
+      console.log(`[${sessionId}] Message from bot itself, skipping`);
+      return;
+    }
 
     const text = msg.message.conversation || 
                  msg.message.extendedTextMessage?.text || 
                  msg.message.imageMessage?.caption ||
                  msg.message.videoMessage?.caption || '';
     
-    console.log(`[${sessionId}] Message from ${msg.key.remoteJid}: ${text}`);
+    console.log(`[${sessionId}] 📩 Incoming message from ${msg.key.remoteJid}: "${text}"`);
 
     try {
-      // Get user settings for prefix
+      // Get user settings
       const settings = await getSettings(msg.key.remoteJid!);
+      console.log(`[${sessionId}] Using prefix: "${settings.prefix}"`);
+      
+      // Auto-read message
+      if (settings.autoRead) {
+        await session.socket.readMessages([msg.key]);
+      }
+      
+      // Send presence (typing/recording)
+      if (settings.autoTyping) {
+        await session.socket.sendPresenceUpdate('composing', msg.key.remoteJid!);
+      } else if (settings.autoRecording) {
+        await session.socket.sendPresenceUpdate('recording', msg.key.remoteJid!);
+      }
       
       // Find and execute command
       const commandData = findCommand(text, settings.prefix);
       
       if (commandData) {
-        console.log(`[${sessionId}] Executing command: ${commandData.command.name}`);
+        console.log(`[${sessionId}] ✅ Command detected: ${commandData.command.name}`);
+        console.log(`[${sessionId}] Executing with args:`, commandData.args);
         await commandData.command.execute(session.socket, msg, commandData.args, settings.prefix);
+        console.log(`[${sessionId}] ✅ Command executed successfully`);
+      } else {
+        console.log(`[${sessionId}] No command found in message`);
+      }
+      
+      // Reset presence
+      if (settings.autoTyping || settings.autoRecording) {
+        await session.socket.sendPresenceUpdate('available', msg.key.remoteJid!);
       }
     } catch (error) {
-      console.error(`Error handling message for ${sessionId}:`, error);
+      console.error(`[${sessionId}] ❌ Error handling message:`, error);
       
       try {
         await session.socket.sendMessage(msg.key.remoteJid!, {
-          text: '❌ An error occurred while processing your command.'
+          text: '❌ An error occurred while processing your command. Please try again.'
         }, {
           quoted: msg
         });
       } catch (sendError) {
-        console.error(`Failed to send error message:`, sendError);
+        console.error(`[${sessionId}] Failed to send error message:`, sendError);
       }
     }
 
@@ -456,7 +495,13 @@ export class SessionManager {
     return sessions;
   }
 
-  async deleteSession(sessionId: string) {
+  async deleteSession(sessionId: string, deleteCode?: string) {
+    // Require delete code for protection
+    const requiredCode = 'meandu';
+    if (deleteCode !== requiredCode) {
+      throw new Error(`Invalid delete code. Required code: "${requiredCode}"`);
+    }
+
     const session = this.sessions.get(sessionId);
     
     if (session?.socket) {
@@ -469,7 +514,7 @@ export class SessionManager {
     }
 
     this.sessions.delete(sessionId);
-    console.log(`Session ${sessionId} deleted`);
+    console.log(`Session ${sessionId} deleted with valid code`);
   }
 
   async cleanup() {
