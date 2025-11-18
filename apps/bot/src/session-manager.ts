@@ -182,10 +182,22 @@ export class SessionManager {
 
     try {
       // Wait a bit for socket to initialize
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
+      // Check if socket is ready
+      if (!sock.user) {
+        console.log(`Socket initializing for ${cleanNumber}, waiting...`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+      
+      console.log(`Requesting pairing code for number: ${cleanNumber}`);
       const code = await sock.requestPairingCode(cleanNumber);
-      pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
+      
+      if (!code) {
+        throw new Error('Pairing code generation returned empty');
+      }
+      
+      pairingCode = code.match(/.{1,4}/g)?.join('-') || code;
       
       const session = this.sessions.get(sessionId);
       if (session) {
@@ -195,12 +207,13 @@ export class SessionManager {
       console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
     } catch (error) {
       console.error('Error requesting pairing code:', error);
+      console.error('Phone number used:', cleanNumber);
       // Clean up failed session
       this.sessions.delete(sessionId);
       if (fs.existsSync(sessionAuthPath)) {
         fs.rmSync(sessionAuthPath, { recursive: true, force: true });
       }
-      throw new Error('Failed to generate pairing code');
+      throw new Error(`Failed to generate pairing code: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 
     return {

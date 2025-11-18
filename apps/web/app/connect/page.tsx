@@ -21,6 +21,8 @@ export default function ConnectPage() {
     try {
       const fullNumber = `${countryCode}${phoneNumber}`.replace(/[^0-9]/g, '');
       
+      console.log('Requesting pairing code for:', fullNumber);
+      
       const response = await fetch('/api/sessions/create', {
         method: 'POST',
         headers: {
@@ -32,15 +34,22 @@ export default function ConnectPage() {
       });
 
       const data = await response.json();
+      console.log('Response from server:', data);
 
       if (!response.ok) {
         throw new Error(data.error || 'Failed to create session');
       }
 
+      if (!data.pairingCode) {
+        throw new Error('No pairing code received from server');
+      }
+
       setSessionId(data.sessionId);
       setPairingCode(data.pairingCode);
+      console.log('Pairing code set:', data.pairingCode);
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred';
+      console.error('Error during session creation:', err);
       setError(errorMessage);
     } finally {
       setLoading(false);
