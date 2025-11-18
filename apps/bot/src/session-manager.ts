@@ -181,50 +181,38 @@ export class SessionManager {
     let pairingCode: string | undefined;
 
     try {
-      // Wait for connection.update event to ensure socket is ready
-      const connectionPromise = new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error('Socket initialization timeout'));
-        }, 15000);
-
-        const handler = (update: any) => {
-          if (update.isNewLogin === false || update.connection === 'connecting') {
-            clearTimeout(timeout);
-            sock.ev.off('connection.update', handler);
-            resolve();
-          }
-        };
-
-        sock.ev.on('connection.update', handler);
-      });
-
-      console.log(`Waiting for socket to initialize for ${cleanNumber}...`);
-      await connectionPromise;
+      // Wait a bit for socket to be ready
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
-      // Additional safety wait
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      console.log(`Socket ready. Requesting pairing code for number: ${cleanNumber}`);
-      console.log(`Number format: ${cleanNumber} (length: ${cleanNumber.length})`);
-      
-      // Request pairing code - Baileys expects just the number without '+'
-      const code = await sock.requestPairingCode(cleanNumber);
-      
-      if (!code) {
-        throw new Error('Pairing code generation returned empty');
+      // Check if socket is open
+      if (!sock.authState.creds.registered) {
+        console.log(`Socket ready. Requesting pairing code for number: ${cleanNumber}`);
+        console.log(`Number format: ${cleanNumber} (length: ${cleanNumber.length})`);
+        
+        // Request pairing code - Baileys expects just the number without '+'
+        const code = await sock.requestPairingCode(cleanNumber);
+        
+        if (!code) {
+          throw new Error('Pairing code generation returned empty');
+        }
+        
+        // Format code as XXXX-XXXX for better readability
+        pairingCode = code.match(/.{1,4}/g)?.join('-') || code;
+        
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          session.pairingCode = pairingCode;
+          session.status = 'pending';
+        }
+        
+        console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
+        console.log(`📱 Enter this code in WhatsApp: Settings → Linked Devices → Link a Device → "Link with phone number instead"`);
+        console.log(`⏳ Waiting for user to enter pairing code in WhatsApp...`);
+        console.log(`🔄 Keep this session alive, do not close!`);
+      } else {
+        console.log(`Device already registered for ${cleanNumber}`);
+        pairingCode = 'ALREADY-REGISTERED';
       }
-      
-      // Format code as XXXX-XXXX for better readability
-      pairingCode = code.match(/.{1,4}/g)?.join('-') || code;
-      
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        session.pairingCode = pairingCode;
-        session.status = 'pending';
-      }
-      
-      console.log(`✅ Generated pairing code for ${cleanNumber}: ${pairingCode}`);
-      console.log(`📱 Enter this code in WhatsApp: Settings → Linked Devices → Link a Device → "Link with phone number instead"`);
     } catch (error) {
       console.error('Error requesting pairing code:', error);
       console.error('Phone number used:', cleanNumber);
@@ -323,10 +311,13 @@ export class SessionManager {
 
       console.log(`Session ${sessionId} disconnected. Status: ${statusCode}, Error: ${errorMessage}, Reconnect: ${shouldReconnect}`);
 
-      // Don't reconnect if it's a fresh session waiting for pairing
-      if (session.status === 'pending') {
-        console.log(`Session ${sessionId} is pending pairing code entry, keeping connection alive`);
-        return;
+      // If pending pairing, we need to handle 401 differently - it might be normal during pairing
+      if (session.status === 'pending' && session.pairingCode) {
+        if (statusCode === 401 || statusCode === DisconnectReason.restartRequired) {
+          console.log(`Session ${sessionId} connection closed during pairing (normal), will reconnect automatically when user enters code`);
+          // Keep session in pending state, don't mark as disconnected
+          return;
+        }
       }
 
       if (shouldReconnect && statusCode !== DisconnectReason.connectionClosed && statusCode !== 401) {
