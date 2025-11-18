@@ -190,7 +190,11 @@ export class SessionManager {
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
       
+      // WhatsApp expects the number in international format without '+'
+      // Example: For Nigeria +234, number should be like 2349074488015
       console.log(`Requesting pairing code for number: ${cleanNumber}`);
+      console.log(`Number length: ${cleanNumber.length}, First digits: ${cleanNumber.substring(0, 5)}`);
+      
       const code = await sock.requestPairingCode(cleanNumber);
       
       if (!code) {
