@@ -52,3 +52,4 @@ prisma/migrations/
 # Old files
 old-bot/
 *.bak
+.env
